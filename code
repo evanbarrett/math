@@ -1,0 +1,169 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.special import erfc
+from scipy.linalg import svd
+from numpy.linalg import norm
+import cvxpy as cp
+
+# Load data from the CSV file
+D = pd.read_csv('M76Data.csv').values
+D = D[1:, :]  # Remove header or first row if necessary
+
+# Constants and initializations
+K = 1
+n = D.shape[0] - 1
+A = np.empty((n, n))
+
+# Construct the matrix A
+for j in range(1, n + 1):
+    for k in range(1, n + 1):
+        A[j - 1, k - 1] = erfc(D[j, 0] / (2 * np.sqrt(K * D[k - 1, 2]))) - erfc(D[j, 0] / (2 * np.sqrt(K * D[k, 2])))
+
+# Extract variables
+Depth = D[1:, 0]
+Temp = D[1:, 1]
+Time = D[1:, 2]
+
+# Singular value decomposition
+U, s, Vt = svd(A, full_matrices=False)
+
+# Regularization parameters
+reg_param = np.logspace(-15, 15, 300)  # From 10^-15to 10^15
+
+# Initialize arrays for L-curve computation
+rho = np.zeros(len(reg_param))
+eta = np.zeros(len(reg_param))
+
+# Tikhonov regularization function
+def tikhonov(U, s, Vt, b, lamb):
+    d = s / (s**2 + lamb**2)
+    x_lambda = Vt.T @ np.diag(d) @ U.T @ b
+    return x_lambda
+
+# Compute L-curve
+for i, lambda_ in enumerate(reg_param):
+    x_lambda = tikhonov(U, s, Vt, Temp, lambda_)
+    rho[i] = norm(A @ x_lambda - Temp)
+    eta[i] = norm(x_lambda)
+
+# Plot L-curve
+plt.figure()
+plt.loglog(eta, rho, '-o', markersize=4)
+plt.xlabel('||x_{λ}|| (Solution Norm)')
+plt.ylabel('||A x_{λ} - Temp|| (Residual Norm)')
+plt.title('L-curve')
+plt.grid(True)
+plt.plot(eta[0], rho[0], 'ro', markersize=6, label='Smallest λ')
+plt.plot(eta[-1], rho[-1], 'go', markersize=6, label='Largest λ')
+plt.legend()
+plt.show()
+
+# Find the optimal regularization parameter from the l curve
+def l_curve(U, s, b):
+    rho = []
+    eta = []
+    for lambda_ in reg_param:
+        x_lambda = tikhonov(U, s, Vt, b, lambda_)
+        rho.append(norm(A @ x_lambda - b))
+        eta.append(norm(x_lambda))
+
+    rho = np.array(rho)
+    eta = np.array(eta)
+    curvature = np.abs(np.diff(np.log(rho)) / np.diff(np.log(eta)))
+    corner_idx = np.argmin(curvature)  # Corner is where the curvature is the smallest
+
+    return reg_param[corner_idx], rho, eta, reg_param
+
+reg_corner, rho, eta, reg_paramL = l_curve(U, s, Temp)
+lambdaL = reg_corner
+print(f'Optimal regularization parameter (L-curve corner): {lambdaL}')
+
+# Reconstruction with the optimal lambda
+XtikhL = tikhonov(U, s, Vt, Temp, lambdaL)
+
+# Least squares solution
+fx_recon_lsqr = np.linalg.lstsq(A, Temp, rcond=None)[0]
+
+# L1 regularization
+lambdaL1 = 0.001 # Regularization Parameter
+fx_recon_l1 = cp.Variable(n)
+objective_l1 = cp.Minimize(cp.norm(A @ fx_recon_l1 - Temp, 2) + lambdaL1 * cp.norm(fx_recon_l1, 1))
+prob_l1 = cp.Problem(objective_l1)
+prob_l1.solve()
+fx_recon_l1 = fx_recon_l1.value
+
+# Total Variation (TV) regularization
+L = -np.diag(np.ones(n)) + np.diag(np.ones(n-1), 1)
+L[n-1, 0] = 1  # Assuming periodicity or zero boundary
+fx_recon_tv = cp.Variable(n)
+objective_tv = cp.Minimize(cp.norm(A @ fx_recon_tv - Temp, 2) + lambdaL1 * cp.norm(L @ fx_recon_tv, 1))
+prob_tv = cp.Problem(objective_tv)
+prob_tv.solve()
+fx_recon_tv = fx_recon_tv.value
+
+# Plot the reconstructions
+plt.figure()
+plt.subplot(2, 2, 1)
+plt.plot(Time, XtikhL, 'r')
+plt.title("Tikhonov Reconstruction")
+
+plt.subplot(2, 2, 2)
+plt.plot(Time, fx_recon_lsqr, 'c')
+plt.title("Least Squares Reconstruction")
+
+plt.subplot(2, 2, 3)
+plt.plot(Time, fx_recon_l1, 'g')
+plt.title("L1 Reconstruction")
+
+plt.subplot(2, 2, 4)
+plt.plot(Time, fx_recon_tv, 'm')
+plt.title("TV Reconstruction")
+
+plt.show()
+
+# Additional regularization methods for parameter comparison
+def gcv(U, s, b):
+    G = []
+    lambdas = np.logspace(-10, 10, 300)
+    for lambda_ in lambdas:
+        x_lambda = tikhonov(U, s, Vt, b, lambda_)
+        resid = A @ x_lambda - b
+        G.append(np.sum(resid**2) / (len(b) - np.sum(s**2 / (s**2 + lambda_**2)))**2)
+    return lambdas[np.argmin(G)], G, lambdas
+
+def ncp(U, s, b):
+    dist = []
+    lambdas = np.logspace(-10, 10, 300)
+    for lambda_ in lambdas:
+        x_lambda = tikhonov(U, s, Vt, b, lambda_)
+        resid = A @ x_lambda - b
+        dist.append(np.sum(resid**2) / np.linalg.norm(b)**2)
+    return lambdas[np.argmin(dist)], dist, lambdas
+
+reg_minGCV, G, reg_paramGCV = gcv(U, s, Temp)
+reg_minNCP, dist, reg_paramNCP = ncp(U, s, Temp)
+
+# Reconstruction for each method
+XtikhGCV = tikhonov(U, s, Vt, Temp, reg_minGCV)
+XtikhNCP = tikhonov(U, s, Vt, Temp, reg_minNCP)
+
+# Plot reconstructions for different lambdas
+plt.figure()
+plt.subplot(2, 3, 1)
+plt.plot(Time, Temp)
+plt.title("Original Data")
+
+plt.subplot(2, 3, 2)
+plt.plot(Time, XtikhL)
+plt.title(f'Reg. Param = {lambdaL:.4f}')
+
+plt.subplot(2, 3, 3)
+plt.plot(Time, XtikhGCV)
+plt.title(f'Reg. Param = {reg_minGCV:.2e}')
+
+plt.subplot(2, 3, 4)
+plt.plot(Time, XtikhNCP)
+plt.title(f'Reg. Param = {reg_minNCP:.2e}')
+
+plt.show()
